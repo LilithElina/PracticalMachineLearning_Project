@@ -1,0 +1,206 @@
+---
+title: "Practical Machine Learning - Predict Exercise Quality"
+output:
+  html_document:
+    fig_caption: yes
+    highlight: haddock
+    theme: spacelab
+---
+
+## Introduction
+
+The data used in this analysis is the [Weight Lifting Exercises](http://groupware.les.inf.puc-rio.br/har#weight_lifting_exercises) (WLE) data set from the [Human Activity Recognition](http://groupware.les.inf.puc-rio.br/har) (HAR) project. It contains measurements of six young, healthy participants doing the Unilateral Dumbbell Biceps Curl in five different ways: the specified, "right", way, and with four common mistakes. Aim of this project is to predict, using any of the on-body measurements provided, which execution mode was used to complete the exercise.
+
+## Exploratory Analysis and Parameter Removal
+
+```{r Prep, echo=FALSE}
+rm(list=ls(all=TRUE))
+#options(stringsAsFactors = FALSE)
+setwd("C:/Users/spo12/Dropbox/coursera/Practical Machine Learning/Project")
+```
+
+```{r Libraries, tidy=TRUE, warning=FALSE, message=FALSE}
+library(caret)
+library(reshape)
+library(ggplot2)
+library(rpart)
+library(rattle)
+library(randomForest)
+```
+
+```{r Data, tidy=TRUE, results='hide'}
+set.seed(135)
+
+training <- read.table("data/pml-training.csv", header=TRUE, row.names=1, sep=",", na.strings=c("", "NA"))
+testing <- read.table("data/pml-testing.csv", header=TRUE, row.names=1, sep=",", na.strings=c("", "NA"))
+
+summary(training)
+head(training)
+```
+
+The training data contains `r nrow(training)` and the testing data `r nrow(testing)` observances of `r ncol(training)` variables each. While the testing set is ignored for now, the training set has to be used to build a prediction model. To facilitate the tuning of said model and the estimation of the out of sample error, the training set will be split into a smaller training and a "pre-test" set.
+
+```{r Partition, tidy=TRUE}
+inTrain <- createDataPartition(y = training$classe, p=0.7, list=FALSE)
+train <- training[inTrain, ]
+test <- training[-inTrain, ]
+```
+
+The smaller training set now has to be analysed to identify the best variables to predict the `classe` variable (the fashion in which the exercise was performed). The variables were measured at the belt, arm and glove of the participants, as well as the dumbbell itself, always in three dimensions (x, y, z) and with different measurements like roll, pitch, yaw and acceleration. For these raw measurements, mean, variance, standard deviation and other statistical summaries were calculated and also included in the data set. These variables contain mostly NA values, with measurements only in rows where the `new_window` variable is set to `yes`. They are excluded from the data, as well as user names and all `timestamp` and `window` variables.
+
+```{r ReductionTrain, tidy=TRUE}
+train_red <- train[, !apply(train, 2, function(x) any(is.na(x)))]
+train_red <- train_red[, -c(1:6)]
+```
+
+After removal of the aforesaid columns, there are still `r ncol(train_red)` variables left, which cannot be simultaneously evaluated in a plot. Another criterion for a good predictor variable is that it has relatively high variance. The `caret` package can test for variables with (near) zero variance, which can then be excluded.
+
+```{r NearZVar, tidy=TRUE}
+nzv <- nearZeroVar(train_red)
+```
+
+In this case, all variables seem to be variable enough, so the `nzv` object is empty and cannot be used for filtering.
+
+A more promising approach with this data set is checking for correlation between the variables. The measurements are all in a way representing the same exercise, so correlation is to be expected.
+
+```{r Corr, tidy=TRUE, results='hide'}
+train_cor <- cor(train_red[, -53])
+train_high_cor <- findCorrelation(train_cor, cutoff=0.75)
+train_red <- train_red[, -train_high_cor]
+summary(train_red)
+```
+
+With a correlation threshold of 0.75, `r length(train_high_cor)` further variables can be removed from the data set, leading to a reduced number of `r ncol(train_red)` variables as potential predictors.
+
+Since there are still so many variables, `caret`'s `featurePlot` function cannot be used to plot these variables, but with `ggplot2` and `facet_wrap`, a grid of box plots (one for each variable) can be created.
+
+```{r Boxplots, tidy=TRUE, warning=FALSE, fig.cap="**Figure 1**: Box plots of possible predictor variables in the different classes.", fig.height=10, fig.width=10}
+train_red.m <- melt(train_red, id.vars="classe")
+ggplot(train_red.m, aes(classe, value)) + geom_boxplot() + facet_wrap(~ variable, scales="free")
+```
+
+Figure 1 shows that some variables are more variable than others when comparing the different `classe`s. One variable, `accel_forearm_z`, shows no differences between the ways the exercise was performed, and can therefore also be removed.
+
+```{r FinalRem, tidy=TRUE}
+train_red <- subset(train_red, select=-c(accel_forearm_z))
+```
+
+## Modelling with Cross-Validation
+
+Cross-validation is a helpful tool when deciding which variables to include in a model, or which type of classifier should be used. In this project, it will be used to test different methods of model creation and estimate the out of sample error.
+
+### Cross Validation Settings
+
+From inside `caret`s `train` function, a 5-fold cross validation with three repetitions will be used. This can be set for all future `train` runs with the `trainControl` function.
+
+```{r CrossValidation, tidy=TRUE}
+fitControl <- trainControl(method = "repeatedcv", number = 5, repeats = 3)
+```
+
+### Decision Tree
+
+Decision trees are a nice way of modelling data, because they are easy to visualise and interpret. They take all variables, look for the different outcomes and split them into smaller groups which are as homogeneous as possible, until the groups are too small to be split or "pure" enough.
+
+```{r DecTre, tidy=TRUE, message=FALSE, warning=FALSE, cache=TRUE}
+mod_fit_tre <- train(classe ~ ., data=train_red,
+                     method="rpart", trControl=fitControl)
+mod_fit_tre
+```
+
+```{r TreePlot, tidy=TRUE, fig.cap="**Figure 2**: Decision tree for the Dumbbell Exercise.", fig.height=7, fig.width=10}
+fancyRpartPlot(mod_fit_tre$finalModel, sub="")
+```
+
+In this case, the decision tree is not a very reliable model, with only `r round(mod_fit_tre$results$Accuracy[1], 4)*100`% accuracy in the best case. The decision tree in Figure 2 shows that eight variables were used to discern the different `classe`s, and that only the groups for `classe`s A and E are relatively "pure". A is the correct performance of the exercise, while the other `classe`s are the common mistakes. B, C, and D a probably too similar to be separated with this model.
+
+### Random Forest
+
+Random forests are a very accurate method, but a major trade-off is speed. This can be helped using the packages `doMC` (on Linux) or `doSNOW` (on Windows) to enable parallel processing for the `train` function.
+
+```{r RanFor, tidy=TRUE, cache=TRUE, message=FALSE, warning=FALSE}
+library(doSNOW)
+cl <- makeCluster(4)
+registerDoSNOW(cl)
+mod_fit_ran <- train(classe ~ ., data=train_red,
+                     method="rf", trControl=fitControl)
+stopCluster(cl)
+mod_fit_ran
+```
+
+The accuracy here is much, much better, with `r round(mod_fit_ran$results$Accuracy[1], 4)*100`%, than in the decision tree model.
+
+### Naive Bayes
+
+A third option to create a model from this data set is assuming an underlying probabilistic model. The naive Bayes classifier applies Bayes' theorem while assuming that the variables used are independent.
+
+```{r NaiBay, tidy=TRUE, cache=TRUE, message=FALSE, warning=FALSE}
+cl <- makeCluster(4)
+registerDoSNOW(cl)
+mod_fit_nba = train(classe ~ ., data=train_red,
+                    method="nb", trControl=fitControl)
+stopCluster(cl)
+mod_fit_nba
+```
+
+This model is better than the decision tree, but not near as good as the random forest (`r round(mod_fit_nba$results$Accuracy[2], 4)*100`% accuracy). The lower accuracy is probably due to the independence assumption not holding for the selected variables.
+
+## Evaluation and Out of Sample Error
+
+As a second validation step, the models can be tested on the "pre-test" data that was separated from the training data set. The columns that were removed from the train data have therefore to be removed from these test data as well.
+
+```{r ReductionTest1, tidy=TRUE}
+test_red <- subset(test, select=colnames(train_red))
+```
+
+This reduced test set can now be used to test the different model's prediction accuracy and calculate the out of sample error.
+
+```{r OoSE, tidy=TRUE, cache=TRUE, warning=FALSE}
+pred_tre <- predict(mod_fit_tre, test_red)
+pred_ran <- predict(mod_fit_ran, test_red)
+pred_nba <- predict(mod_fit_nba, test_red)
+
+table(pred_tre,test$classe)
+table(pred_ran,test$classe)
+table(pred_nba,test$classe)
+```
+
+We can see in the tables that most predictions are correct in the model using random forests, while especially the model using decision trees seems to yield relatively bad results (even for `classe` A).
+
+The out of sample error can easily be calculated by counting the number of wrong predictions and dividing that number by the sum of all predictions. Accordingly, the out of sample error estimated for the decision tree model is `r round(sum(pred_tre!=test$classe)/length(pred_tre),3)`, while the out of sample error is `r round(sum(pred_ran!=test$classe)/length(pred_ran),3)` for the random forest model and `r round(sum(pred_nba!=test$classe)/length(pred_nba),3)` for the naive Bayes approach.
+
+Therefore, to solve the task and predict the `classe`s of the twenty cases in the testing set, the random forest model will be used.
+
+## Prediction
+
+Again, the columns that were removed prior to model creation also have to be removed from this set.
+
+```{r ReductionTest2, tidy=TRUE}
+# there is no classe column in the testing set
+testing_red <- subset(testing, select=colnames(train_red)[1:30])
+```
+
+Now the `classe`s of the twenty test cases can be predicted with the random forest model.
+
+```{r Predict, tidy=TRUE}
+pred_sol <- predict(mod_fit_ran, testing_red)
+pred_sol
+```
+
+```{r Submission, tidy=TRUE, echo=FALSE}
+pml_write_files <- function(x){
+  n <- length(x)
+  for(i in 1:n){
+    filename <- paste0("results/problem_id_", i, ".txt")
+    write.table(x[i], file=filename, quote=FALSE, row.names=FALSE, col.names=FALSE)
+  }
+}
+pml_write_files(pred_sol)
+```
+
+Uploading the results on the appropriate coursera [webpage](https://www.coursera.org/course/predmachlearn) results in full marks, so the model seems to work under "real world" conditions.
+
+******
+
+```{r Version}
+version
+```
